@@ -6,10 +6,11 @@ from typing import Annotated
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, SecretStr
 
+from . import capabilities as capability_contract
 from . import constants, demo, modal_session, models
 from .contracts import ContractError
 from .jobs import JobService
@@ -99,8 +100,8 @@ def create_app(service: JobService | None = None) -> FastAPI:
         try:
             # Capabilities are a local static document; there is no gateway to
             # discover them from and no Modal session required to read them.
-            return models.capabilities_document()
-        except models.CapabilityError as exc:
+            return capability_contract.capabilities_document()
+        except capability_contract.CapabilityError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get("/v1/models")
@@ -109,7 +110,7 @@ def create_app(service: JobService | None = None) -> FastAPI:
             return {"models": [dict(m) for m in demo.capability_document()["models"]]}
         try:
             return {"models": models.public_models()}
-        except models.CapabilityError as exc:
+        except capability_contract.CapabilityError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.get("/v1/jobs")
@@ -139,7 +140,7 @@ def create_app(service: JobService | None = None) -> FastAPI:
             )
         except modal_session.NotConnectedError as exc:
             raise HTTPException(status_code=409, detail="Modal connection required") from exc
-        except (ContractError, models.CapabilityError) as exc:
+        except (ContractError, capability_contract.CapabilityError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/v1/jobs/{job_id}")
@@ -187,6 +188,11 @@ def create_app(service: JobService | None = None) -> FastAPI:
                 "maxBytes": constants.SOURCE_MAX_BYTES,
             },
         }
+
+    @app.get("/", include_in_schema=False)
+    def ui_root():
+        """Match modal-2D-client: send the bare origin to the packaged UI."""
+        return RedirectResponse(url="/ui/index.html", status_code=307)
 
     def _allow_origin(request: Request) -> str:
         # Any origin is allowed. Set MODAL_3D_CLIENT_ORIGIN to a single origin

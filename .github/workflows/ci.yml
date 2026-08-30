@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: modal-3D-client
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          path: modal-3D-client
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: xiaoqianran/modal-3D
+          path: modal-3D
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          working-directory: modal-3D-client
+      - run: uv lock --check
+      - run: uv sync --dev --frozen
+      - run: uv run ruff check .
+      - run: uv run python -m compileall -q modal_3d_client tests
+      - run: uv run pytest -q

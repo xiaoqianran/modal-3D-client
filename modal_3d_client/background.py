@@ -37,3 +37,25 @@ def predict_mask(data: bytes) -> dict[str, object]:
         "elapsed_ms": value.get("elapsed_ms"),
         "source_size": value.get("source_size"),
     }
+
+
+def spawn_prepare_source(source_path: str):
+    """Spawn cloud-side source preparation and return its persistent FunctionCall."""
+    if not source_path:
+        raise ValueError("source_path is required")
+    remote_cls = modal.Cls.from_name(APP_NAME, CLASS_NAME, client=client())
+    return remote_cls().prepare.spawn(source_path)
+
+
+def prepare_source(source_path: str) -> dict[str, object]:
+    """Synchronously prepare a shared-volume source for compatibility callers."""
+    if not source_path:
+        raise ValueError("source_path is required")
+    remote_cls = modal.Cls.from_name(APP_NAME, CLASS_NAME, client=client())
+    value = remote_cls().prepare.remote(source_path)
+    if not isinstance(value, dict):
+        raise TypeError("background worker returned an invalid prepared source")
+    path = value.get("path")
+    if not isinstance(path, str) or not path.startswith("client-inputs/"):
+        raise TypeError("background worker returned an invalid canonical input path")
+    return dict(value)

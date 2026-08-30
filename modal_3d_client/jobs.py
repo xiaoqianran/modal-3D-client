@@ -24,7 +24,7 @@ from modal.exception import (
 from modal.exception import ConnectionError as ModalConnectionError
 from modal.exception import TimeoutError as ModalTimeoutError
 
-from . import artifacts, generation, models
+from . import artifacts, background, generation, models
 from .constants import CLIENT_INPUT_PREFIX
 from .contracts import ContractError
 from .modal_session import NotConnectedError, client
@@ -50,6 +50,7 @@ _JOB_COLUMNS = (
     "seed",
     "input_path",
     "input_sha256",
+    "prepare_call_id",
     "remote_call_id",
     "status",
     "created_at",
@@ -81,6 +82,7 @@ class Job:
     status: str
     created_at: str
     updated_at: str
+    prepare_call_id: str | None = None
     result: dict[str, object] | None = None
     error_code: str | None = None
     retryable: bool | None = None
@@ -139,6 +141,7 @@ class JobStore:
                 seed INTEGER NOT NULL,
                 input_path TEXT NOT NULL,
                 input_sha256 TEXT NOT NULL,
+                prepare_call_id TEXT,
                 remote_call_id TEXT,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -151,9 +154,7 @@ class JobStore:
             """
         )
 
-    def _rebuild_legacy_table(
-        self, db: sqlite3.Connection, schema: dict[str, tuple]
-    ) -> None:
+    def _rebuild_legacy_table(self, db: sqlite3.Connection, schema: dict[str, tuple]) -> None:
         """Atomically normalize every historical jobs schema to the current one."""
 
         columns = set(schema)
@@ -180,6 +181,7 @@ class JobStore:
                 {source("seed", "42")},
                 {source("input_path", "''")},
                 {source("input_sha256", "''")},
+                {source("prepare_call_id", "NULL")},
                 {source("remote_call_id", "NULL")},
                 {source("status", "'failed'")},
                 {source("created_at", "''")},
@@ -197,7 +199,7 @@ class JobStore:
     def _load(self) -> None:
         with self._connect() as db:
             rows = db.execute(
-                "SELECT id,model,profile,seed,input_path,input_sha256,remote_call_id,status,"
+                "SELECT id,model,profile,seed,input_path,input_sha256,prepare_call_id,remote_call_id,status,"
                 "created_at,updated_at,result_json,error_code,retryable,conditioning_json FROM jobs"
             ).fetchall()
         with self._lock:
@@ -209,14 +211,15 @@ class JobStore:
                     seed=row[3],
                     input_path=row[4],
                     input_sha256=row[5],
-                    remote_call_id=row[6],
-                    status=row[7],
-                    created_at=row[8],
-                    updated_at=row[9],
-                    result=json.loads(row[10]) if row[10] else None,
-                    error_code=row[11],
-                    retryable=None if row[12] is None else bool(row[12]),
-                    conditioning=json.loads(row[13]) if row[13] else None,
+                    prepare_call_id=row[6],
+                    remote_call_id=row[7],
+                    status=row[8],
+                    created_at=row[9],
+                    updated_at=row[10],
+                    result=json.loads(row[11]) if row[11] else None,
+                    error_code=row[12],
+                    retryable=None if row[13] is None else bool(row[13]),
+                    conditioning=json.loads(row[14]) if row[14] else None,
                 )
                 for row in rows
             }
@@ -227,15 +230,16 @@ class JobStore:
                 """
                 INSERT INTO jobs (
                     id, model, profile, seed, input_path, input_sha256,
-                    remote_call_id, status, created_at, updated_at,
+                    prepare_call_id, remote_call_id, status, created_at, updated_at,
                     result_json, error_code, retryable, conditioning_json
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     model=excluded.model,
                     profile=excluded.profile,
                     seed=excluded.seed,
                     input_path=excluded.input_path,
                     input_sha256=excluded.input_sha256,
+                    prepare_call_id=excluded.prepare_call_id,
                     remote_call_id=excluded.remote_call_id,
                     status=excluded.status,
                     updated_at=excluded.updated_at,
@@ -251,6 +255,7 @@ class JobStore:
                     job.seed,
                     job.input_path,
                     job.input_sha256,
+                    job.prepare_call_id,
                     job.remote_call_id,
                     job.status,
                     job.created_at,
@@ -258,7 +263,9 @@ class JobStore:
                     json.dumps(job.result, separators=(",", ":")) if job.result else None,
                     job.error_code,
                     None if job.retryable is None else int(job.retryable),
-                    json.dumps(job.conditioning, separators=(",", ":")) if job.conditioning else None,
+                    json.dumps(job.conditioning, separators=(",", ":"))
+                    if job.conditioning
+                    else None,
                 ),
             )
         with self._lock:
@@ -335,6 +342,210 @@ class JobService:
                 mask=mask,
             )
 
+    def submit_remote_source(
+        self,
+        source_path: str,
+        *,
+        source_sha256: str,
+        model: str,
+        profile: str = "recommended",
+        seed: int = 42,
+        job_id: str | None = None,
+    ) -> dict[str, object]:
+        """Start cloud-side conditioning without blocking the submit request.
+
+        The raw source already lives in the shared Modal Volume. We persist the
+        preparation FunctionCall separately from the generation FunctionCall so
+        polling, cancellation and Connector restarts can advance the same job.
+        """
+        local_id = job_id or f"job_{uuid.uuid4().hex}"
+        if not _JOB_ID.fullmatch(local_id):
+            raise ContractError("job_id must be a URL-safe identifier")
+        with self._submission_lock(local_id):
+            models.options_for(model, profile, seed)
+            existing = self._existing(local_id, model, profile, seed, source_sha256)
+            if existing is not None:
+                return existing.public()
+            timestamp = _now()
+            intent = Job(
+                id=local_id,
+                model=model,
+                profile=profile,
+                seed=seed,
+                input_path=source_path,
+                input_sha256=source_sha256,
+                remote_call_id=None,
+                status="running",
+                created_at=timestamp,
+                updated_at=timestamp,
+                retryable=True,
+            )
+            self.store.save(intent)
+            return self._start_preparation(intent).public()
+
+    def _start_preparation(self, job: Job) -> Job:
+        if job.status == "cancel_requested":
+            return job
+        try:
+            generation.prefetch(job.model)
+        except _RECOVERABLE:
+            pass
+        try:
+            call = background.spawn_prepare_source(job.input_path)
+        except _RECOVERABLE:
+            latest = self.store.get(job.id)
+            if latest.status == "cancel_requested":
+                return latest
+            return self._save(
+                latest,
+                status="connection_required",
+                error_code="modal.connection_required",
+                retryable=True,
+            )
+        latest = self.store.get(job.id)
+        if latest.status == "cancel_requested":
+            try:
+                call.cancel()
+            except _RECOVERABLE:
+                pass
+            return latest
+        return self._save(
+            latest,
+            prepare_call_id=str(call.object_id),
+            status="running",
+            error_code=None,
+            retryable=True,
+        )
+
+    def _poll_preparation(self, job: Job) -> Job:
+        if not job.prepare_call_id:
+            return job
+        try:
+            call = modal.FunctionCall.from_id(job.prepare_call_id, client=client())
+            prepared = call.get(timeout=0)
+        except (ModalTimeoutError, TimeoutError):
+            if job.status not in {"running", "cancel_requested"}:
+                return self._save(job, status="running", error_code=None, retryable=True)
+            return job
+        except (OutputExpiredError, NotFoundError):
+            return self._save(
+                job,
+                prepare_call_id=None,
+                status="connection_required",
+                error_code="remote.preparation_expired",
+                retryable=True,
+            )
+        except _RECOVERABLE:
+            return self._save(
+                job,
+                status="connection_required",
+                error_code="modal.connection_required",
+                retryable=True,
+            )
+        except RemoteError:
+            if job.status == "cancel_requested":
+                return self._save(
+                    job,
+                    prepare_call_id=None,
+                    status="cancelled",
+                    error_code="remote.cancelled",
+                    retryable=False,
+                )
+            return self._save(
+                job,
+                prepare_call_id=None,
+                status="failed",
+                error_code="remote.conditioning_failed",
+                retryable=False,
+            )
+        if not isinstance(prepared, dict):
+            return self._save(
+                job,
+                prepare_call_id=None,
+                status="failed",
+                error_code="conditioning.invalid_response",
+                retryable=False,
+            )
+        if str(prepared.get("source_sha256") or "") != job.input_sha256:
+            return self._save(
+                job,
+                prepare_call_id=None,
+                status="failed",
+                error_code="conditioning.identity_changed",
+                retryable=False,
+            )
+        input_path = str(prepared.get("path") or "")
+        if not input_path.startswith(CLIENT_INPUT_PREFIX):
+            return self._save(
+                job,
+                prepare_call_id=None,
+                status="failed",
+                error_code="conditioning.invalid_path",
+                retryable=False,
+            )
+        latest = self.store.get(job.id)
+        if latest.status == "cancel_requested":
+            return self._save(
+                latest,
+                prepare_call_id=None,
+                status="cancelled",
+                error_code="remote.cancelled",
+                retryable=False,
+            )
+        prepared_job = self._save(
+            latest,
+            prepare_call_id=None,
+            input_path=input_path,
+            conditioning=dict(prepared.get("conditioning") or {}),
+            status="running",
+            error_code=None,
+            retryable=True,
+        )
+        return self._bind(prepared_job)
+
+    def _existing(
+        self, local_id: str, model: str, profile: str, seed: int, input_sha256: str
+    ) -> Job | None:
+        try:
+            existing = self.store.get(local_id)
+        except KeyError:
+            return None
+        expected = (model, profile, seed, input_sha256)
+        actual = (existing.model, existing.profile, existing.seed, existing.input_sha256)
+        if actual != expected:
+            raise ContractError("job_id is already bound to another request")
+        return existing
+
+    def _create_and_bind(
+        self,
+        *,
+        local_id: str,
+        model: str,
+        profile: str,
+        seed: int,
+        input_path: str,
+        input_sha256: str,
+        conditioning: dict[str, object],
+    ) -> Job:
+        timestamp = _now()
+        intent = Job(
+            id=local_id,
+            model=model,
+            profile=profile,
+            seed=seed,
+            input_path=input_path,
+            input_sha256=input_sha256,
+            prepare_call_id=None,
+            remote_call_id=None,
+            status="submitting",
+            created_at=timestamp,
+            updated_at=timestamp,
+            retryable=True,
+            conditioning=conditioning,
+        )
+        self.store.save(intent)
+        return self._bind(intent)
+
     def _submit_locked(
         self,
         source_image: bytes,
@@ -350,15 +561,8 @@ class JobService:
             raise ContractError("job_id must be a URL-safe identifier")
         models.options_for(model, profile, seed)
         local_input = artifacts.validate_source_image(source_image)
-        try:
-            existing = self.store.get(local_id)
-        except KeyError:
-            existing = None
+        existing = self._existing(local_id, model, profile, seed, str(local_input["sha256"]))
         if existing is not None:
-            expected = (model, profile, seed, str(local_input["sha256"]))
-            actual = (existing.model, existing.profile, existing.seed, existing.input_sha256)
-            if actual != expected:
-                raise ContractError("job_id is already bound to another request")
             return existing.public()
 
         # The model is already known at this point. Start its GPU container now so
@@ -374,23 +578,15 @@ class JobService:
         input_path = str(uploaded["path"])
         if not input_path.startswith(CLIENT_INPUT_PREFIX):
             raise ContractError(f"uploaded input must live under {CLIENT_INPUT_PREFIX}")
-        timestamp = _now()
-        intent = Job(
-            id=local_id,
+        return self._create_and_bind(
+            local_id=local_id,
             model=model,
             profile=profile,
             seed=seed,
             input_path=input_path,
             input_sha256=str(uploaded["sha256"]),
-            remote_call_id=None,
-            status="submitting",
-            created_at=timestamp,
-            updated_at=timestamp,
-            retryable=True,
             conditioning=dict(uploaded["conditioning"]),  # type: ignore[arg-type]
-        )
-        self.store.save(intent)
-        return self._bind(intent).public()
+        ).public()
 
     def _bind(self, job: Job) -> Job:
         if job.status == "cancel_requested":
@@ -453,8 +649,15 @@ class JobService:
         job = self.store.get(job_id)
         if job.status in _TERMINAL:
             return job.public()
+        if job.prepare_call_id:
+            job = self._poll_preparation(job)
+            if job.status in _TERMINAL or job.prepare_call_id:
+                return job.public()
         if not job.remote_call_id:
             if job.status == "cancel_requested":
+                return job.public()
+            if not job.input_path.startswith(CLIENT_INPUT_PREFIX):
+                job = self._start_preparation(job)
                 return job.public()
             job = self._bind(job)
             if not job.remote_call_id:
@@ -508,6 +711,30 @@ class JobService:
         job = self.store.get(job_id)
         if job.status in _TERMINAL:
             return job.public()
+        if job.prepare_call_id and not job.remote_call_id:
+            try:
+                modal.FunctionCall.from_id(job.prepare_call_id, client=client()).cancel()
+            except _RECOVERABLE:
+                return self._save(
+                    job,
+                    status="connection_required",
+                    error_code="modal.connection_required",
+                    retryable=True,
+                ).public()
+            except (OutputExpiredError, NotFoundError):
+                return self._save(
+                    job,
+                    prepare_call_id=None,
+                    status="expired",
+                    error_code="remote.preparation_expired",
+                    retryable=False,
+                ).public()
+            return self._save(
+                job,
+                status="cancel_requested",
+                error_code=None,
+                retryable=True,
+            ).public()
         if not job.remote_call_id:
             return self._save(
                 job,
